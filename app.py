@@ -361,11 +361,16 @@ def quitar_articulo_inicial(toponimo_norm: str) -> str:
 
 
 def limpiar_serie_coordenadas(serie: pd.Series) -> pd.Series:
-    """Convierte una serie de coordenadas con comas, espacios, puntos de miles o símbolos a float."""
+    """Convierte una serie de coordenadas con comas, espacios, puntos de miles o símbolos a float64 estándar."""
     if pd.api.types.is_bool_dtype(serie):
         return pd.Series(np.nan, index=serie.index, dtype="float64")
     if pd.api.types.is_numeric_dtype(serie):
-        return pd.to_numeric(serie, errors="coerce").replace([np.inf, -np.inf], np.nan)
+        arr = pd.to_numeric(serie, errors="coerce").to_numpy(
+            dtype="float64", na_value=np.nan
+        )
+        return pd.Series(arr, index=serie.index, dtype="float64").replace(
+            [np.inf, -np.inf], np.nan
+        )
 
     def _limpiar_str(val: Any) -> Any:
         if val is None or (isinstance(val, float) and np.isnan(val)):
@@ -400,7 +405,12 @@ def limpiar_serie_coordenadas(serie: pd.Series) -> pd.Series:
     )
     # Extraer primer número decimal con signo opcional si viene acompañado de texto
     extraida = limpia.str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False)
-    return pd.to_numeric(extraida, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    arr = pd.to_numeric(extraida, errors="coerce").to_numpy(
+        dtype="float64", na_value=np.nan
+    )
+    return pd.Series(arr, index=serie.index, dtype="float64").replace(
+        [np.inf, -np.inf], np.nan
+    )
 
 
 def reparar_coordenadas_sin_punto(
@@ -413,21 +423,31 @@ def reparar_coordenadas_sin_punto(
     al interpretarlo como separador de miles (ej. 40136215 -> 40.136215).
     Devuelve (lat_reparada, lon_reparada, fue_reparada).
     """
-    if pd.isna(lat) or pd.isna(lon) or not np.isfinite(lat) or not np.isfinite(lon):
-        return lat, lon, False
+    if pd.isna(lat) or pd.isna(lon):
+        return (
+            np.nan if pd.isna(lat) else float(lat),
+            np.nan if pd.isna(lon) else float(lon),
+            False,
+        )
 
-    if esta_en_rango_espana(lat, lon) or esta_en_rango_espana(lon, lat):
-        return lat, lon, False
+    lat_f = float(lat)
+    lon_f = float(lon)
 
-    if abs(lat) <= 90 and abs(lon) <= 180:
-        return lat, lon, False
+    if not np.isfinite(lat_f) or not np.isfinite(lon_f):
+        return lat_f, lon_f, False
+
+    if esta_en_rango_espana(lat_f, lon_f) or esta_en_rango_espana(lon_f, lat_f):
+        return lat_f, lon_f, False
+
+    if abs(lat_f) <= 90 and abs(lon_f) <= 180:
+        return lat_f, lon_f, False
 
     # Candidatos para latitud positiva en España (2 dígitos enteros: 27.3..44.2)
     cands_lat: List[float] = []
-    if 27.3 <= lat <= 44.2:
-        cands_lat.append(float(lat))
-    elif lat > 90:
-        dig_lat = str(int(round(abs(lat))))
+    if 27.3 <= lat_f <= 44.2:
+        cands_lat.append(lat_f)
+    elif lat_f > 90:
+        dig_lat = str(int(round(abs(lat_f))))
         if len(dig_lat) >= 2:
             val_lat = float(
                 f"{dig_lat[:2]}.{dig_lat[2:]}" if len(dig_lat) > 2 else dig_lat
@@ -437,11 +457,11 @@ def reparar_coordenadas_sin_punto(
 
     # Candidatos para longitud en España (-18.5..5.0): k in {1, 2, 0}
     cands_lon: List[Tuple[float, Optional[int]]] = []
-    if -18.5 <= lon <= 5.0:
-        cands_lon.append((float(lon), None))
-    elif abs(lon) > 180:
-        sign = -1.0 if lon < 0 else 1.0
-        dig_lon = str(int(round(abs(lon))))
+    if -18.5 <= lon_f <= 5.0:
+        cands_lon.append((lon_f, None))
+    elif abs(lon_f) > 180:
+        sign = -1.0 if lon_f < 0 else 1.0
+        dig_lon = str(int(round(abs(lon_f))))
         for k in (1, 2, 0):
             if k == 0:
                 val_lon = sign * float(f"0.{dig_lon}")
@@ -464,7 +484,7 @@ def reparar_coordenadas_sin_punto(
     ]
 
     if not candidatos_validos:
-        return lat, lon, False
+        return lat_f, lon_f, False
 
     if len(candidatos_validos) == 1:
         c_lat, c_lon, _ = candidatos_validos[0]
@@ -533,11 +553,19 @@ def separar_coordenadas_combinadas(
     extraido = df_out[col_combinada].astype(str).str.extract(patron)
     col_lat = "_LATITUD_EXTRAIDA"
     col_lon = "_LONGITUD_EXTRAIDA"
-    df_out[col_lat] = pd.to_numeric(
-        extraido[0].str.replace(",", ".", regex=False), errors="coerce"
+    df_out[col_lat] = pd.Series(
+        pd.to_numeric(
+            extraido[0].str.replace(",", ".", regex=False), errors="coerce"
+        ).to_numpy(dtype="float64", na_value=np.nan),
+        index=df_out.index,
+        dtype="float64",
     )
-    df_out[col_lon] = pd.to_numeric(
-        extraido[1].str.replace(",", ".", regex=False), errors="coerce"
+    df_out[col_lon] = pd.Series(
+        pd.to_numeric(
+            extraido[1].str.replace(",", ".", regex=False), errors="coerce"
+        ).to_numpy(dtype="float64", na_value=np.nan),
+        index=df_out.index,
+        dtype="float64",
     )
     return df_out, col_lat, col_lon
 
@@ -1113,9 +1141,9 @@ def ejecutar_auditoria(
             n_la, n_lo, rep = reparar_coordenadas_sin_punto(
                 la, lo, centro_ref=centro_ref
             )
-            lats_nuevas.append(n_la)
-            lons_nuevas.append(n_lo)
-            reparadas_flags.append(rep)
+            lats_nuevas.append(np.nan if pd.isna(n_la) else float(n_la))
+            lons_nuevas.append(np.nan if pd.isna(n_lo) else float(n_lo))
+            reparadas_flags.append(bool(rep))
 
         df[col_latitud] = pd.Series(lats_nuevas, index=df.index, dtype="float64")
         df[col_longitud] = pd.Series(lons_nuevas, index=df.index, dtype="float64")
@@ -1752,6 +1780,52 @@ def _leer_hojas_excel(archivo_bytes: bytes) -> List[str]:
     return list(xl.sheet_names)
 
 
+def seleccionar_hoja_por_defecto(archivo_bytes: bytes, hojas: List[str]) -> int:
+    """
+    Elige automáticamente el índice de la hoja más probable con el catálogo
+    (evitando portadas o índices iniciales) al puntuar columnas clave detectadas.
+    """
+    if len(hojas) <= 1:
+        return 0
+
+    mejor_idx = 0
+    mejor_score = -1
+
+    try:
+        with pd.ExcelFile(io.BytesIO(archivo_bytes), engine="openpyxl") as xl:
+            for idx, hoja in enumerate(hojas):
+                try:
+                    df_muestra = pd.read_excel(xl, sheet_name=hoja, nrows=50)
+                except Exception:
+                    continue
+                df_muestra = df_muestra.dropna(how="all")
+                if df_muestra.empty:
+                    continue
+
+                det = detectar_columnas_inteligente(df_muestra)
+                score = 0
+                if det.get("latitud"):
+                    score += 3
+                if det.get("longitud"):
+                    score += 3
+                if det.get("municipio"):
+                    score += 3
+                if det.get("recurso"):
+                    score += 1
+                if (
+                    det.get("latitud") is None or det.get("longitud") is None
+                ) and detectar_columna_coordenadas_combinadas(df_muestra):
+                    score += 4
+
+                if score > mejor_score:
+                    mejor_score = score
+                    mejor_idx = idx
+    except Exception:
+        return 0
+
+    return mejor_idx
+
+
 def _leer_dataframe_excel(archivo_bytes: bytes, nombre_hoja: str) -> pd.DataFrame:
     df = pd.read_excel(
         io.BytesIO(archivo_bytes),
@@ -1909,10 +1983,11 @@ def main() -> None:
 
     hoja_seleccionada = hojas[0]
     if len(hojas) > 1:
+        idx_hoja_defecto = seleccionar_hoja_por_defecto(archivo_bytes, hojas)
         hoja_seleccionada = st.sidebar.selectbox(
             "Hoja del Excel",
             options=hojas,
-            index=0,
+            index=idx_hoja_defecto,
         )
 
     try:
