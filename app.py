@@ -31,6 +31,10 @@ URL_IGN_MUNICIPIOS = (
     "https://github.com/rOpenSpain/mapSpain/raw/sianedata/dist/"
     "se89_3_admin_muni_a_x.gpkg"
 )
+URL_IGN_MUNICIPIOS_CANARIAS = (
+    "https://github.com/rOpenSpain/mapSpain/raw/sianedata/dist/"
+    "se89_3_admin_muni_a_y.gpkg"
+)
 
 PROVINCIAS_INE: Dict[str, str] = {
     "01": "Álava",
@@ -357,22 +361,135 @@ def quitar_articulo_inicial(toponimo_norm: str) -> str:
 
 
 def limpiar_serie_coordenadas(serie: pd.Series) -> pd.Series:
-    """Convierte una serie de coordenadas con comas, espacios o símbolos a float."""
+    """Convierte una serie de coordenadas con comas, espacios, puntos de miles o símbolos a float."""
     if pd.api.types.is_bool_dtype(serie):
         return pd.Series(np.nan, index=serie.index, dtype="float64")
     if pd.api.types.is_numeric_dtype(serie):
         return pd.to_numeric(serie, errors="coerce").replace([np.inf, -np.inf], np.nan)
-    limpia = (
-        serie.astype(str)
-        .str.replace("\u00a0", "", regex=False)
-        .str.replace("°", "", regex=False)
-        .str.replace("º", "", regex=False)
-        .str.strip()
-        .str.replace(",", ".", regex=False)
+
+    def _limpiar_str(val: Any) -> Any:
+        if val is None or (isinstance(val, float) and np.isnan(val)):
+            return pd.NA
+        try:
+            if pd.isna(val):
+                return pd.NA
+        except (TypeError, ValueError):
+            pass
+        s = (
+            str(val)
+            .replace("\u00a0", "")
+            .replace("°", "")
+            .replace("º", "")
+            .strip()
+        )
+        if not s:
+            return pd.NA
+        if "," in s:
+            if "." in s:
+                s = s.replace(".", "")
+            s = s.replace(",", ".")
+        elif re.match(r"^[-+]?\d+(?:\.\d+){2,}$", s):
+            # Varios puntos sin coma (ej. "40.136.215" por separador de miles en Excel)
+            s = s.replace(".", "")
+        return s
+
+    limpia = pd.Series(
+        [_limpiar_str(v) for v in serie],
+        index=serie.index,
+        dtype="string",
     )
     # Extraer primer número decimal con signo opcional si viene acompañado de texto
     extraida = limpia.str.extract(r"([-+]?\d+(?:\.\d+)?)", expand=False)
     return pd.to_numeric(extraida, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+
+def reparar_coordenadas_sin_punto(
+    lat: float,
+    lon: float,
+    centro_ref: Optional[Tuple[float, float]] = None,
+) -> Tuple[float, float, bool]:
+    """
+    Repara coordenadas españolas a las que Excel eliminó el punto decimal
+    al interpretarlo como separador de miles (ej. 40136215 -> 40.136215).
+    Devuelve (lat_reparada, lon_reparada, fue_reparada).
+    """
+    if pd.isna(lat) or pd.isna(lon) or not np.isfinite(lat) or not np.isfinite(lon):
+        return lat, lon, False
+
+    if esta_en_rango_espana(lat, lon) or esta_en_rango_espana(lon, lat):
+        return lat, lon, False
+
+    if abs(lat) <= 90 and abs(lon) <= 180:
+        return lat, lon, False
+
+    # Candidatos para latitud positiva en España (2 dígitos enteros: 27.3..44.2)
+    cands_lat: List[float] = []
+    if 27.3 <= lat <= 44.2:
+        cands_lat.append(float(lat))
+    elif lat > 90:
+        dig_lat = str(int(round(abs(lat))))
+        if len(dig_lat) >= 2:
+            val_lat = float(
+                f"{dig_lat[:2]}.{dig_lat[2:]}" if len(dig_lat) > 2 else dig_lat
+            )
+            if 27.3 <= val_lat <= 44.2:
+                cands_lat.append(val_lat)
+
+    # Candidatos para longitud en España (-18.5..5.0): k in {1, 2, 0}
+    cands_lon: List[Tuple[float, Optional[int]]] = []
+    if -18.5 <= lon <= 5.0:
+        cands_lon.append((float(lon), None))
+    elif abs(lon) > 180:
+        sign = -1.0 if lon < 0 else 1.0
+        dig_lon = str(int(round(abs(lon))))
+        for k in (1, 2, 0):
+            if k == 0:
+                val_lon = sign * float(f"0.{dig_lon}")
+            elif len(dig_lon) >= k:
+                parte_ent = dig_lon[:k]
+                parte_dec = dig_lon[k:]
+                val_lon = sign * float(
+                    f"{parte_ent}.{parte_dec}" if parte_dec else parte_ent
+                )
+            else:
+                continue
+            if -18.5 <= val_lon <= 5.0:
+                cands_lon.append((val_lon, k))
+
+    candidatos_validos: List[Tuple[float, float, Optional[int]]] = [
+        (c_lat, c_lon, k_lon)
+        for c_lat in cands_lat
+        for c_lon, k_lon in cands_lon
+        if esta_en_rango_espana(c_lat, c_lon)
+    ]
+
+    if not candidatos_validos:
+        return lat, lon, False
+
+    if len(candidatos_validos) == 1:
+        c_lat, c_lon, _ = candidatos_validos[0]
+        return c_lat, c_lon, True
+
+    if centro_ref is not None:
+        ref_lat, ref_lon = centro_ref
+        mejor = min(
+            candidatos_validos,
+            key=lambda item: (item[0] - ref_lat) ** 2 + (item[1] - ref_lon) ** 2,
+        )
+        return mejor[0], mejor[1], True
+
+    def _prioridad_sin_ref(item: Tuple[float, float, Optional[int]]) -> Tuple[int, float]:
+        c_lat, _, k_lon = item
+        if c_lat >= 35.0:
+            prio = 0 if k_lon in (1, None) else (1 if k_lon == 0 else 2)
+        elif c_lat < 32.0:
+            prio = 0 if k_lon in (2, None) else 1
+        else:
+            prio = 0
+        return (prio, abs(item[1]))
+
+    mejor = min(candidatos_validos, key=_prioridad_sin_ref)
+    return mejor[0], mejor[1], True
 
 
 def esta_en_rango_espana(lat: float, lon: float) -> bool:
@@ -440,15 +557,16 @@ def _puntuar_columna(col_norm: str, sinonimos: Sequence[str]) -> float:
         if col_norm == sin:
             return 1.0 - (idx * 0.002)
 
-    # Nivel 2: coincidencia de palabra completa o subcadena fuerte
+    # Nivel 2: coincidencia de palabra completa o subcadena fuerte (evitando falsos positivos en sinónimos cortos)
     tokens_col = set(col_norm.split())
     mejor = 0.0
     for sin in sinonimos:
         tokens_sin = set(sin.split())
-        if len(sin) >= 3 and sin in col_norm:
-            score = 0.85 if tokens_sin.issubset(tokens_col) else 0.78
-            mejor = max(mejor, score)
-        elif len(col_norm) >= 3 and col_norm in sin:
+        if tokens_sin.issubset(tokens_col):
+            mejor = max(mejor, 0.85)
+        elif len(sin) >= 5 and sin in col_norm:
+            mejor = max(mejor, 0.78)
+        elif len(col_norm) >= 5 and col_norm in sin:
             mejor = max(mejor, 0.72)
         else:
             ratio = difflib.SequenceMatcher(None, col_norm, sin).ratio()
@@ -592,8 +710,15 @@ def preparar_gdf_ign(gdf_raw: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Estandariza columnas de un GeoDataFrame de municipios del IGN en EPSG:4326
     con columnas: MUNICIPIO_OFICIAL_IGN, PROVINCIA_OFICIAL_IGN, COD_PROVINCIA_IGN, geometry.
+    Filtra municipios históricos dados de baja si existe la columna 'fecha_baja'.
     """
     gdf = gdf_raw.copy()
+    if "fecha_baja" in gdf.columns:
+        mask_vigentes = gdf["fecha_baja"].isna() | (
+            gdf["fecha_baja"].astype(str).str.strip() == ""
+        )
+        gdf = gdf[mask_vigentes].copy()
+
     cols_ign = list(gdf.columns)
 
     cand_nombre = [
@@ -611,6 +736,7 @@ def preparar_gdf_ign(gdf_raw: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         col_ign_nombre = [c for c in cols_ign if c != "geometry"][0]
 
     cand_cpro = [
+        "id_prov",
         "cpro",
         "CPRO",
         "cod_prov",
@@ -647,7 +773,7 @@ def preparar_gdf_ign(gdf_raw: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         col_ine = next(
             (
                 c
-                for c in ["inecode", "cod_ine", "codigo_ine", "id", "LAU_CODE"]
+                for c in ["id_ine", "inecode", "cod_ine", "codigo_ine", "id", "LAU_CODE"]
                 if c in cols_ign
             ),
             None,
@@ -685,9 +811,29 @@ def preparar_gdf_ign(gdf_raw: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 @st.cache_resource(show_spinner=False)
 def cargar_cartografia_ign(url: str = URL_IGN_MUNICIPIOS) -> gpd.GeoDataFrame:
-    """Descarga y cachea en memoria la cartografía municipal oficial del IGN."""
+    """
+    Descarga y cachea en memoria la cartografía municipal oficial del IGN,
+    incluyendo opcionalmente la capa oficial de Canarias si no viene en el archivo principal.
+    """
     gdf_raw = gpd.read_file(url, engine="pyogrio")
-    return preparar_gdf_ign(gdf_raw)
+    gdf_pen = preparar_gdf_ign(gdf_raw)
+
+    provs_presentes = set(gdf_pen["COD_PROVINCIA_IGN"].dropna().unique())
+    if url == URL_IGN_MUNICIPIOS and not any(
+        cp in provs_presentes for cp in PROVINCIAS_CANARIAS
+    ):
+        try:
+            gdf_raw_can = gpd.read_file(URL_IGN_MUNICIPIOS_CANARIAS, engine="pyogrio")
+            if not gdf_raw_can.empty:
+                gdf_can = preparar_gdf_ign(gdf_raw_can)
+                gdf_combinado = pd.concat([gdf_pen, gdf_can], ignore_index=True)
+                return gpd.GeoDataFrame(
+                    gdf_combinado, geometry="geometry", crs="EPSG:4326"
+                )
+        except Exception:
+            pass
+
+    return gdf_pen
 
 
 def obtener_set_municipios_ign(gdf_espana_4326: gpd.GeoDataFrame) -> set:
@@ -902,12 +1048,14 @@ def ejecutar_auditoria(
     col_id: Optional[str] = None,
     codigo_provincia_ine: Optional[str] = None,
     umbrales: Optional[Dict[str, float]] = None,
+    reparar_sin_punto: bool = True,
 ) -> pd.DataFrame:
     """
     Ejecuta la auditoría geoespacial completa sobre el DataFrame de entrada.
 
     - codigo_provincia_ine: código de 2 dígitos (ej. '10') o None/'00' para Toda España.
     - umbrales: dict con claves 'fronterizo', 'borde', 'moderado', 'notable' (en metros).
+    - reparar_sin_punto: si True, repara coordenadas españolas sin punto decimal (ej. 40136215 -> 40.136215).
     """
     if umbrales is None:
         umbrales = {
@@ -933,6 +1081,45 @@ def ejecutar_auditoria(
     # Limpieza segura de coordenadas en columnas de trabajo y originales
     df[col_latitud] = limpiar_serie_coordenadas(df[col_latitud])
     df[col_longitud] = limpiar_serie_coordenadas(df[col_longitud])
+    df["COORD_REPARADA"] = pd.Series(False, index=df.index, dtype="bool")
+
+    if reparar_sin_punto:
+        centro_ref: Optional[Tuple[float, float]] = None
+        if cod_prov_objetivo:
+            gdf_prov = gdf_espana_4326[
+                gdf_espana_4326["COD_PROVINCIA_IGN"] == cod_prov_objetivo
+            ]
+            if not gdf_prov.empty:
+                bounds = gdf_prov.total_bounds
+                centro_ref = (
+                    float((bounds[1] + bounds[3]) / 2.0),
+                    float((bounds[0] + bounds[2]) / 2.0),
+                )
+        if centro_ref is None:
+            mask_esp_valida = [
+                esta_en_rango_espana(la, lo)
+                for la, lo in zip(df[col_latitud], df[col_longitud])
+            ]
+            if any(mask_esp_valida):
+                centro_ref = (
+                    float(df.loc[mask_esp_valida, col_latitud].median()),
+                    float(df.loc[mask_esp_valida, col_longitud].median()),
+                )
+
+        lats_nuevas: List[float] = []
+        lons_nuevas: List[float] = []
+        reparadas_flags: List[bool] = []
+        for la, lo in zip(df[col_latitud], df[col_longitud]):
+            n_la, n_lo, rep = reparar_coordenadas_sin_punto(
+                la, lo, centro_ref=centro_ref
+            )
+            lats_nuevas.append(n_la)
+            lons_nuevas.append(n_lo)
+            reparadas_flags.append(rep)
+
+        df[col_latitud] = pd.Series(lats_nuevas, index=df.index, dtype="float64")
+        df[col_longitud] = pd.Series(lons_nuevas, index=df.index, dtype="float64")
+        df["COORD_REPARADA"] = pd.Series(reparadas_flags, index=df.index, dtype="bool")
 
     # Diagnóstico de inversión Lat/Lon (compatible con Península, Baleares y Canarias)
     def _evaluar_rango(lat: float, lon: float) -> str:
@@ -1646,18 +1833,18 @@ def main() -> None:
         st.header("2. Ámbito Territorial")
 
         opciones_prov = [
-            ("AUTO", "✨ Autodetectar provincia desde el Excel"),
-            ("00", "🇪🇸 Toda España (sin filtro provincial)"),
-        ] + [(cod, f"{cod} - {nom}") for cod, nom in sorted(PROVINCIAS_INE.items())]
+            (cod, f"{cod} - {nom}") for cod, nom in sorted(PROVINCIAS_INE.items())
+        ] + [("00", "00 - Toda España (sin filtro provincial)")]
 
         etiquetas_prov = [etq for _, etq in opciones_prov]
         codigos_prov = [cod for cod, _ in opciones_prov]
+        idx_caceres = codigos_prov.index("10") if "10" in codigos_prov else 0
 
         sel_prov_etq = st.selectbox(
             "Provincia auditada",
             options=etiquetas_prov,
-            index=0,
-            help="Por defecto se detecta automáticamente la provincia dominante del Excel.",
+            index=idx_caceres,
+            help="Selecciona manualmente la provincia de referencia para resolver homónimos y alertas interprovinciales.",
         )
         codigo_prov_seleccionado = codigos_prov[etiquetas_prov.index(sel_prov_etq)]
 
@@ -1692,6 +1879,14 @@ def main() -> None:
             step=500,
         )
         st.caption(f"Más de {umbral_notable:,} m → **ERROR_GRAVE**".replace(",", "."))
+
+        st.divider()
+        st.header("4. Limpieza de Coordenadas")
+        reparar_sin_punto = st.checkbox(
+            "Reparar coordenadas sin punto decimal (ej. 40136215 → 40.136215)",
+            value=True,
+            help="Corrige coordenadas a las que Excel en español eliminó el punto decimal al interpretarlo como separador de miles.",
+        )
 
     # Estado inicial sin archivo
     if archivo_subido is None:
@@ -1802,27 +1997,18 @@ def main() -> None:
         )
         st.stop()
 
-    # Resolver provincia final (autodetección o selección manual)
-    if codigo_prov_seleccionado == "AUTO":
-        cod_auto, nom_auto, n_match, n_tot = detectar_provincia_automatica(
-            df_trabajo, col_latitud, col_longitud, col_municipio, gdf_espana_4326
-        )
-        codigo_prov_efectivo = cod_auto
-        nombre_prov_efectivo = nom_auto
-        if cod_auto:
-            st.success(
-                f"📍 Provincia detectada automáticamente: **{nom_auto} (INE {cod_auto})** "
-                f"({n_match} de {n_tot} registros geolocalizados)."
-            )
-        else:
-            st.info("No se pudo autodetectar una provincia concreta; se auditará contra **Toda España**.")
-    elif codigo_prov_seleccionado == "00":
+    # Resolver provincia final (selección manual)
+    if codigo_prov_seleccionado == "00":
         codigo_prov_efectivo = None
         nombre_prov_efectivo = "Toda España"
+        st.info("🇪🇸 Ámbito territorial seleccionado: **Toda España (sin filtro provincial)**.")
     else:
         codigo_prov_efectivo = codigo_prov_seleccionado
         nombre_prov_efectivo = PROVINCIAS_INE.get(
             codigo_prov_seleccionado, codigo_prov_seleccionado
+        )
+        st.success(
+            f"📍 Provincia auditada: **{nombre_prov_efectivo} (INE {codigo_prov_efectivo})**"
         )
 
     umbrales = {
@@ -1844,6 +2030,18 @@ def main() -> None:
             col_id=col_id,
             codigo_provincia_ine=codigo_prov_efectivo,
             umbrales=umbrales,
+            reparar_sin_punto=reparar_sin_punto,
+        )
+
+    reparadas_count = (
+        int(df_auditado["COORD_REPARADA"].sum())
+        if "COORD_REPARADA" in df_auditado.columns
+        else 0
+    )
+    if reparadas_count > 0:
+        st.info(
+            f"🔧 Se normalizaron automáticamente **{reparadas_count}** registro(s) cuyas coordenadas "
+            "venían sin punto decimal en el Excel (ej. `40136215` → `40.136215`)."
         )
 
     # Métricas del informe ejecutivo
