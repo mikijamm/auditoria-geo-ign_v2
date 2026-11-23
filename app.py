@@ -1424,11 +1424,16 @@ def generar_mapa_folium(
     mapa = folium.Map(
         location=[centro_lat, centro_lon],
         zoom_start=zoom_inicial,
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri & IGN",
+        tiles=None,
         width="100%",
         height="100%",
     )
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri & IGN",
+        name="Esri World Street Map",
+        control=False,
+    ).add_to(mapa)
 
     # Añadir contornos municipales (simplificación ligera solo para renderizado rápido)
     if not gdf_contornos.empty:
